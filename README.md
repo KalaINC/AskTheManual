@@ -31,8 +31,10 @@ Ensure you have Python 3.10+ installed.
 ```bash
 pip install streamlit docling langchain-huggingface langchain-community faiss-cpu sentence-transformers requests ttkbootstrap openai
 ```
-*(Note: `ttkbootstrap` is required for the new GUI.)*
-
+*(Note: `ttkbootstrap` is required for the new GUI.)*  
+```bash
+docling-tools models download
+```
 ### 2. Setup Ollama (Local LLM)
 1.  Install **Ollama** from [ollama.com](https://ollama.com).
 2.  Pull a model (e.g., Qwen 2.5):
@@ -41,7 +43,14 @@ pip install streamlit docling langchain-huggingface langchain-community faiss-cp
     ```
 3.  Make sure the Ollama server is running.
 
-### 3. OpenAI API Key (Optional but Recommended)
+### 3. Setup Embedding Model (Prevents GUI Freeze)
+The project uses `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`. To avoid the GUI freezing while downloading this model on the first run, execute this one-liner:
+
+```bash
+python -c "from langchain_huggingface import HuggingFaceEmbeddings; HuggingFaceEmbeddings(model_name='sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')"
+```
+
+### 4. OpenAI API Key (Optional but Recommended)
 For automatic image description (**Vision AI**), you need an OpenAI API key. 
 -   Export it: `export OPENAI_API_KEY="sk-..."` 
 -   Or paste it into `image_to_information.py` (not recommended for production).
