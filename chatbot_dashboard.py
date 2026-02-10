@@ -11,10 +11,10 @@ SERVER_IP = "127.0.0.1"
 OLLAMA_URL = f"http://{SERVER_IP}:11434/api/generate"
 MODEL_NAME = "qwen2.5:7b"
 INDEX_PATH = "faiss_index"
-IMAGE_BASE_DIR = Path("extracted_data") # Basis-Ordner deiner Daten
+IMAGE_BASE_DIR = Path("extracted_data") 
 
 # --- UI SETUP ---
-st.set_page_config(page_title="Handbuch KI Chatbot", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="Handbuch KI Chatbot", page_icon="", layout="wide")
 
 # CSS für schönere Bilder und Chat-Layout
 st.markdown("""
@@ -24,7 +24,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🤖 Handbuch Chatbot")
+st.title("Handbuch Chatbot")
 
 # --- RESSOURCEN LADEN ---
 @st.cache_resource
@@ -70,6 +70,7 @@ def format_chat_history(chat_history, max_turns=4):
     formatted += "--- ENDE GESPRÄCHSVERLAUF ---\n"
     return formatted
 
+
 def ask_local_professor(query, chat_history=None):
     # Erweiterte Suche: Kontext aus Chat-Historie einbeziehen
     search_query = build_contextual_query(query, chat_history or [])
@@ -86,48 +87,79 @@ def ask_local_professor(query, chat_history=None):
     history_context = format_chat_history(chat_history)
 
     system_prompt = (
-        "Du bist der Wiki-Experte für verschiedene Software-Systeme. Nutze den KONTEXT.\n"
-        "WICHTIG: Beachte den BISHERIGEN GESPRÄCHSVERLAUF um Bezüge wie 'sie', 'es', 'das' zu verstehen.\n"
-        "Wenn der Kunde z.B. fragt 'Wie starte ich sie?' und vorher über Software X gesprochen wurde, "
-        "beziehe dich auf Software X.\n\n"
-        "WICHTIG FÜR BILDER:\n"
-        "1. Bilder liegen jetzt in Unterordnern, z.B. images/softwarename/diagramm_1.png.\n"
-        "2. Identifiziere ALLE Bildpfade im Kontext, die zu deiner Antwort passen.\n"
-        "3. Nenne am Ende deiner Antwort UNBEDINGT die vollständigen Pfade unter 'BILD_REFERENZ:'.\n"
-        "4. Nutze exakt den Pfad, der im Kontext steht (inklusive Software-Ordner)."
+        "Du bist ein hilfreicher interner Experte für unsere Software. Deine Aufgabe ist es, Fragen basierend auf dem folgenden HANDBUCH-KONTEXT zu beantworten.\n\n"
+        
+        "ANWEISUNGEN:\n"
+        "1. ANALYSE: Verstehe das Problem des Nutzers. Ignoriere irrelevante Füllwörter (z.B. 'Mein Chef sagt', 'Ich bin genervt'). Konzentriere dich auf den technischen Kern.\n"
+        "2. WISSENSBASIS: Nutze NUR die Informationen aus dem untenstehenden KONTEXT. Erfinde keine Fakten.\n"
+        "3. TRANSFERLEISTUNG: Wenn der Nutzer Begriffe verwendet, die nicht exakt im Text stehen (z.B. 'verknüpfen' statt 'integrieren' oder 'Knopf' statt 'Button'), erkenne den Sinn und antworte trotzdem.\n"
+        "4. Identifiziere ALLE Bildpfade im Kontext, die zu deiner Antwort passen, versuche jedoch redundanz zu vermeiden, nutze hierfür die für dich vorbereiteten Bildbeschreibungen. Nenne am Ende deiner Antwort UNBEDINGT die vollständigen Pfade unter 'BILD_REFERENZ:'.\n"
+        "5. SRACHE: Antworte professionell, direkt und per 'Du'.\n\n"
+        
+        "WICHTIG:\n"
+        "Wenn der Kontext KEINE Lösung für das technische Problem bietet, antworte, ohne Bilder anzuhängen:\n"
+        "'Dazu liegen mir im aktuellen Handbuch keine Informationen vor. Bitte wende dich an unsere Hotline.'\n"
     )
     
     payload = {
         "model": MODEL_NAME,
         "prompt": f"{system_prompt}\n\n{history_context}\nKONTEXT:\n{context}\n\nAKTUELLE FRAGE: {query}",
-        "stream": False 
+        "stream": False,
+        "options": {
+            "temperature": 0.1 
+        }
     }
 
     try:
         response = requests.post(OLLAMA_URL, json=payload, timeout=45)
         response.raise_for_status()
-        answer = response.json()['response']
+        full_response = response.json()['response']
         
-        # VERBESSERTER REGEX: Findet Pfade wie images/turbomed/diagramm_1.png
-        # Er sucht nach: (optional images/) + (beliebiger Ordnername/) + diagramm_X.png
-        raw_images = re.findall(r"(?:images/)?[\w-]+/diagramm_\d+\.png", answer)
+        # --- BILD-EXTRAKTION (Dein existierender Code, leicht optimiert) ---
+        raw_images = re.findall(r"(?:images/)?[\w-]+/diagramm_\d+\.png", full_response)
         
-        # Falls die KI den Pfad unvollständig nennt (z.B. nur "turbomed/diagramm_1.png")
         clean_images = []
         for img in raw_images:
             if not img.startswith("images/"):
                 img = f"images/{img}"
             clean_images.append(img)
             
-        clean_answer = answer.split("BILD_REFERENZ:")[0].strip()
-        return clean_answer, list(set(clean_images)), source_chunks
+        # Text bereinigen (Pfade im Text entfernen, damit sie nicht doppelt wirken)
+        clean_answer = full_response
+        for img in raw_images:
+            clean_answer = clean_answer.replace(img, "")
+            
+        # Markdown-Bildreste entfernen
+        clean_answer = re.sub(r'!\[.*?\]\(\s*\)', '', clean_answer)
+        clean_answer = re.sub(r'Bild_Referenz:?', '', clean_answer, flags=re.IGNORECASE)
+        clean_answer = re.sub(r'^\s*[\*\-\•]\s*$', '', clean_answer, flags=re.MULTILINE)
+        clean_answer = re.sub(r'\n\s*\n', '\n\n', clean_answer).strip()
+        clean_answer = clean_answer.strip()
+        
+        # Duplikate entfernen und sortieren
+        seen = set()
+        unique_images = []
+        for img in clean_images:
+            if img not in seen:
+                seen.add(img)
+                unique_images.append(img)
+        
+        # Nach Diagramm-Nummer sortieren (diagramm_3 vor diagramm_4)
+        def extract_number(path):
+            match = re.search(r'diagramm_(\d+)', path)
+            return int(match.group(1)) if match else 0
+        
+        unique_images.sort(key=extract_number)
+        
+        return clean_answer, unique_images, source_chunks
+
     except Exception as e:
         return f"Fehler bei der Verbindung zu Ollama: {e}", [], []
 
 # --- SIDEBAR: QUELLEN-CHECK ---
 with st.sidebar:
-    st.header("🔍 Quellen-Inspektor")
-    st.info("Hier siehst du die Textabschnitte, die die KI gerade als Basis nutzt.")
+    st.header("Quellen")
+    st.info("Textabschnitte, die die KI gerade als Basis nutzt.")
     if "last_sources" in st.session_state:
         for src in st.session_state.last_sources:
             st.markdown(f"**Kapitel: {src['header']}**")
