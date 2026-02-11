@@ -1,15 +1,16 @@
 import streamlit as st
 import os
 import re
-import requests
+from openai import OpenAI
 from pathlib import Path
+from dotenv import load_dotenv
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # --- KONFIGURATION ---
-SERVER_IP = "127.0.0.1" 
-OLLAMA_URL = f"http://{SERVER_IP}:11434/api/generate"
-MODEL_NAME = "qwen2.5:7b"
+load_dotenv()  # Lädt OPENAI_API_KEY aus .env Datei
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+GPT_MODEL = "gpt-5-nano-2025-08-07"  # Oder "gpt-4o", "gpt-3.5-turbo", etc.
 INDEX_PATH = "faiss_index"
 IMAGE_BASE_DIR = Path("extracted_data") 
 
@@ -36,22 +37,44 @@ def load_resources():
 vector_db = load_resources()
 
 # --- LOGIK FUNKTION ---
-def build_contextual_query(query, chat_history, max_history=3):
+def reformulate_query(query, chat_history, max_history=3):
     """
-    Baut eine erweiterte Suchanfrage aus der aktuellen Frage + letzten Nachrichten.
-    Das hilft bei Pronomen wie 'sie', 'es', 'das' die sich auf vorherige Themen beziehen.
+    Nutzt GPT, um eine Folgefrage in eine eigenständige Suchanfrage umzuformulieren.
+    z.B. 'Wie füge ich was ein?' → 'Wie fügt man Medien zur Kontextliste im Kontextfenster hinzu?'
+    Das liefert deutlich bessere Vektorsuche-Ergebnisse als bloßes Zusammenkleben.
     """
     if not chat_history:
         return query
     
-    # Letzte N Nachrichten sammeln (nur User + Assistant content)
-    recent_context = []
-    for msg in chat_history[-max_history * 2:]:  # *2 weil User+Assistant Paare
-        recent_context.append(msg["content"][:200])  # Begrenzen um Token zu sparen
+    # Nur die letzten Nachrichten-Paare als Kontext
+    recent = chat_history[-(max_history * 2):]
     
-    # Kombinierte Anfrage für bessere Vektorsuche
-    combined = " ".join(recent_context) + " " + query
-    return combined
+    messages = [
+        {"role": "system", "content": (
+            "Deine Aufgabe: Formuliere die Folgefrage des Nutzers als EINE eigenständige, "
+            "klare Suchanfrage um. Löse dabei Pronomen wie 'sie', 'es', 'das' auf und "
+            "integriere den nötigen Kontext aus dem Gesprächsverlauf. "
+            "Antworte NUR mit der umformulierten Frage, ohne Erklärung."
+        )}
+    ]
+    for msg in recent:
+        role = msg["role"]
+        content = msg["content"][:300] if role == "assistant" else msg["content"]
+        messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": f"Folgefrage: {query}"})
+    
+    try:
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=messages,
+            temperature=1,
+            max_completion_tokens=5000,
+        )
+        reformulated = response.choices[0].message.content.strip()
+        return reformulated if reformulated else query
+    except Exception:
+        # Fallback: Originalfrage verwenden
+        return query
 
 def format_chat_history(chat_history, max_turns=4):
     """
@@ -72,8 +95,8 @@ def format_chat_history(chat_history, max_turns=4):
 
 
 def ask_local_professor(query, chat_history=None):
-    # Erweiterte Suche: Kontext aus Chat-Historie einbeziehen
-    search_query = build_contextual_query(query, chat_history or [])
+    # Folgefrage umformulieren für bessere Vektorsuche
+    search_query = reformulate_query(query, chat_history or [])
     docs = vector_db.similarity_search(search_query, k=5)
     
     context = ""
@@ -93,27 +116,40 @@ def ask_local_professor(query, chat_history=None):
         "1. ANALYSE: Verstehe das Problem des Nutzers. Ignoriere irrelevante Füllwörter (z.B. 'Mein Chef sagt', 'Ich bin genervt'). Konzentriere dich auf den technischen Kern.\n"
         "2. WISSENSBASIS: Nutze NUR die Informationen aus dem untenstehenden KONTEXT. Erfinde keine Fakten.\n"
         "3. TRANSFERLEISTUNG: Wenn der Nutzer Begriffe verwendet, die nicht exakt im Text stehen (z.B. 'verknüpfen' statt 'integrieren' oder 'Knopf' statt 'Button'), erkenne den Sinn und antworte trotzdem.\n"
-        "4. Identifiziere ALLE Bildpfade im Kontext, die zu deiner Antwort passen, versuche jedoch redundanz zu vermeiden, nutze hierfür die für dich vorbereiteten Bildbeschreibungen. Nenne am Ende deiner Antwort UNBEDINGT die vollständigen Pfade unter 'BILD_REFERENZ:'.\n"
+        "4. Falls der Kontext die Lösung enthält: Identifiziere ALLE passenden Bildpfade und nenne sie am Ende deiner Antwort unter 'BILD_REFERENZ:'. Falls keine Lösung im Kontext steht, darf unter keinen Umständen eine BILD_REFERENZ erscheinen.\n"
         "5. SRACHE: Antworte professionell, direkt und per 'Du'.\n\n"
         
         "WICHTIG:\n"
-        "Wenn der Kontext KEINE Lösung für das technische Problem bietet, antworte, ohne Bilder anzuhängen:\n"
-        "'Dazu liegen mir im aktuellen Handbuch keine Informationen vor. Bitte wende dich an unsere Hotline.'\n"
+        "Wenn der Kontext KEINE Lösung bietet, antworte ausschließlich mit dem Satz:\n"
+        "'Dazu liegen mir im aktuellen Handbuch keine Informationen vor. Bitte wende dich an unsere Hotline.' Gib in diesem Fall keine Bildpfade, Referenzen oder weitere Erklärungen aus.\n"
     )
-    
-    payload = {
-        "model": MODEL_NAME,
-        "prompt": f"{system_prompt}\n\n{history_context}\nKONTEXT:\n{context}\n\nAKTUELLE FRAGE: {query}",
-        "stream": False,
-        "options": {
-            "temperature": 0.1 
-        }
-    }
+
+    # GPT Messages aufbauen
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+
+    # Chat-Historie als separate Messages hinzufügen
+    if chat_history:
+        for msg in chat_history[-(4 * 2):]:
+            role = msg["role"]  # "user" oder "assistant" passt direkt
+            content = msg["content"][:500] if role == "assistant" else msg["content"]
+            messages.append({"role": role, "content": content})
+
+    # Aktuelle Frage mit Kontext als User-Message
+    messages.append({
+        "role": "user",
+        "content": f"KONTEXT:\n{context}\n\nAKTUELLE FRAGE: {query}"
+    })
 
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=45)
-        response.raise_for_status()
-        full_response = response.json()['response']
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=messages,
+            temperature=1,
+            max_completion_tokens=5000,
+        )
+        full_response = response.choices[0].message.content
         
         # --- BILD-EXTRAKTION (Dein existierender Code, leicht optimiert) ---
         raw_images = re.findall(r"(?:images/)?[\w-]+/diagramm_\d+\.png", full_response)
@@ -154,7 +190,7 @@ def ask_local_professor(query, chat_history=None):
         return clean_answer, unique_images, source_chunks
 
     except Exception as e:
-        return f"Fehler bei der Verbindung zu Ollama: {e}", [], []
+        return f"Fehler bei der Verbindung zur OpenAI API: {e}", [], []
 
 # --- SIDEBAR: QUELLEN-CHECK ---
 with st.sidebar:
